@@ -1,9 +1,12 @@
 /**
  * index.js — Pipedrive MCP Server
  * ─────────────────────────────────────────────
- * MCP SDK v1.x uses setRequestHandler(), not server.tool().
- * Transport: SSE over HTTP for cloud hosting.
- * Auth: Bearer token on every request.
+ * MCP SDK v1.x SSE transport pattern:
+ *   GET  /sse       — client connects, server streams events back
+ *   POST /messages  — client sends tool-call messages (must include ?sessionId=)
+ *
+ * Auth: Bearer token required on /sse. /messages uses sessionId to find
+ * the already-authenticated transport, so no separate auth needed there.
  */
 
 import 'dotenv/config';
@@ -11,13 +14,11 @@ import express from 'express';
 import { Server }             from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { createRequire }      from 'module';
+import { createRequire } from 'module';
 
-// zodToJsonSchema via CJS (avoids ESM subpath issues with that package)
 const _require = createRequire(import.meta.url);
 const { zodToJsonSchema } = _require('zod-to-json-schema');
 
-// Tool modules
 import { leadTools }       from './tools/leads.js';
 import { duplicateTools }  from './tools/duplicates.js';
 import { activityTools }   from './tools/activities.js';
@@ -46,14 +47,17 @@ const ALL_TOOLS = [
   ...reportTools,
 ];
 
-// ── Create a fresh MCP Server for each SSE connection ────────────────────────
+// ── Active transports — keyed by sessionId ────────────────────────────────────
+// The SSE client receives its sessionId via the stream, then uses it on POST /messages
+const activeTransports = new Map();
+
+// ── MCP server factory ────────────────────────────────────────────────────────
 function createMcpServer() {
   const server = new Server(
     { name: 'pipedrive-mcp', version: '1.0.0' },
     { capabilities: { tools: {} } }
   );
 
-  // Advertise the tool list
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: ALL_TOOLS.map(t => ({
       name:        t.name,
@@ -62,7 +66,6 @@ function createMcpServer() {
     })),
   }));
 
-  // Handle tool calls
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const tool = ALL_TOOLS.find(t => t.name === request.params.name);
     if (!tool) {
@@ -90,26 +93,58 @@ function createMcpServer() {
 const app = express();
 app.use(express.json());
 
+// CORS — allow Cowork/Claude to connect from any origin
+app.use((_req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  if (_req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 function requireAuth(req, res, next) {
   const token = (req.headers['authorization'] ?? '').replace(/^Bearer\s+/i, '').trim();
   if (token !== MCP_AUTH_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    return res.status(401).json({ error: 'Unauthorized — check MCP_AUTH_TOKEN' });
   }
   next();
 }
 
+// Health check (no auth)
 app.get('/health', (_req, res) =>
   res.json({ status: 'ok', server: 'pipedrive-mcp', tools: ALL_TOOLS.length, time: new Date().toISOString() })
 );
 
+// SSE endpoint — auth required here; client gets a sessionId back via the stream
 app.get('/sse', requireAuth, async (req, res) => {
   console.log(`[SSE] Client connected from ${req.ip}`);
   const transport = new SSEServerTransport('/messages', res);
-  const server    = createMcpServer();
+
+  // Store so POST /messages can route to the right transport
+  activeTransports.set(transport.sessionId, transport);
+  console.log(`[SSE] Session ${transport.sessionId} registered`);
+
+  req.on('close', () => {
+    activeTransports.delete(transport.sessionId);
+    console.log(`[SSE] Session ${transport.sessionId} closed`);
+  });
+
+  const server = createMcpServer();
   await server.connect(transport);
 });
 
-app.post('/messages', requireAuth, async (_req, res) => res.status(200).end());
+// Message endpoint — no separate auth; sessionId links to an already-authenticated transport
+app.post('/messages', async (req, res) => {
+  const sessionId  = req.query.sessionId;
+  const transport  = activeTransports.get(sessionId);
+
+  if (!transport) {
+    console.warn(`[Messages] Unknown sessionId: ${sessionId}`);
+    return res.status(400).json({ error: `No active session for sessionId: ${sessionId}` });
+  }
+
+  await transport.handlePostMessage(req, res);
+});
 
 app.listen(PORT, () => {
   console.log(`\n✅ Pipedrive MCP server on port ${PORT} — ${ALL_TOOLS.length} tools loaded`);
