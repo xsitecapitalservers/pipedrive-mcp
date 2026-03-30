@@ -143,7 +143,7 @@ app.post('/messages', async (req, res) => {
     return res.status(400).json({ error: `No active session for sessionId: ${sessionId}` });
   }
 
-  await transport.handlePostMessage(req, res);
+  await transport.handlePostMessage(req, res, req.body);
 });
 
 app.listen(PORT, () => {
