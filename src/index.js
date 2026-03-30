@@ -105,40 +105,43 @@ app.get('/health', (_req, res) =>
 const streamableTransports = new Map(); // sessionId → transport
 
 app.all('/mcp', async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'];
+  const incomingSessionId = req.headers['mcp-session-id'];
 
   // Re-use existing transport for this session
-  if (sessionId && streamableTransports.has(sessionId)) {
-    const transport = streamableTransports.get(sessionId);
+  if (incomingSessionId && streamableTransports.has(incomingSessionId)) {
+    const transport = streamableTransports.get(incomingSessionId);
     await transport.handleRequest(req, res, req.body);
     return;
   }
 
-  // New session — only POST (initialize) should create a new transport
+  // Unknown / missing session — only POST (initialize) should start a new one.
+  // The SDK will return 404 for tool calls with stale session IDs, signalling
+  // the client to re-initialize.
   if (req.method !== 'POST') {
-    res.status(400).json({ error: 'No session found. Send POST to initialize.' });
+    res.status(404).json({ error: 'Session not found. Reconnect to re-initialize.' });
     return;
   }
 
+  // Pre-generate the session ID so we can store the transport immediately,
+  // before handleRequest resolves (avoids async timing issues).
+  const newSessionId = randomUUID();
+
   const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
+    sessionIdGenerator: () => newSessionId,
   });
 
+  // Store immediately — don't wait for handleRequest
+  streamableTransports.set(newSessionId, transport);
+  console.log(`[MCP] New session ${newSessionId}`);
+
   transport.onclose = () => {
-    if (transport.sessionId) streamableTransports.delete(transport.sessionId);
-    console.log(`[MCP] Session ${transport.sessionId} closed`);
+    streamableTransports.delete(newSessionId);
+    console.log(`[MCP] Session ${newSessionId} closed`);
   };
 
   const server = createMcpServer();
   await server.connect(transport);
-
-  // Handle the initialize request — after connect the sessionId is set
   await transport.handleRequest(req, res, req.body);
-
-  if (transport.sessionId) {
-    streamableTransports.set(transport.sessionId, transport);
-    console.log(`[MCP] New session ${transport.sessionId}`);
-  }
 });
 
 // ── Legacy SSE endpoints (/sse + /messages) ───────────────────────────────────
