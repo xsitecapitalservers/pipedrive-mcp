@@ -74,8 +74,10 @@ export const organizations = {
 };
 
 // ── Activities ────────────────────────────────────────────────────────────────
+// user_id: 0 = return activities for ALL users (requires admin token).
+// Any caller can override by passing { user_id: <specific_id> }.
 export const activities = {
-  getAll: (opts = {}) => _acts.getActivities(opts),
+  getAll: (opts = {}) => _acts.getActivities({ user_id: 0, ...opts }),
   create: (body)      => _acts.addActivity({ addActivityRequest: body }),
   update: (id, body)  => _acts.updateActivity(id, { updateActivityRequest: body }),
 };
