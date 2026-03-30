@@ -1,57 +1,43 @@
 /**
  * tools/activities.js — Task & Activity Management
- * ─────────────────────────────────────────────
- * Tools:
- *   get_upcoming_activities  - list tasks due in the next N days
- *   get_overdue_activities   - list tasks that are past due
- *   notify_upcoming_tasks    - send Teams alert for upcoming tasks
- *   notify_overdue_tasks     - send Teams alert for overdue tasks
- *   create_activity          - create a new task/call/meeting in Pipedrive
- *   mark_activity_done       - mark an activity as completed
  */
 
-import { activitiesApi, usersApi, formatActivity } from '../pipedrive.js';
+import { activities, formatActivity } from '../pipedrive.js';
 import { notifyUpcomingTasks, notifyOverdueTasks } from '../teams.js';
 import { z } from 'zod';
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function todayStr() {
-  return new Date().toISOString().slice(0, 10);
-}
-function futureDateStr(days) {
+function todayStr()         { return new Date().toISOString().slice(0, 10); }
+function dateStr(daysAhead) {
   const d = new Date();
-  d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
+  d.setDate(d.getDate() + daysAhead);
+  return d.toISOString().replace('T', ' ').slice(0, 19); // YYYY-MM-DD HH:MM:SS
 }
 
-// ── Tools ─────────────────────────────────────────────────────────────────────
 export const activityTools = [
 
-  // ── get_upcoming_activities ─────────────────────────────────────────────────
   {
     name: 'get_upcoming_activities',
-    description: 'List all open (not yet done) activities due within the next N days. ' +
-                 'Optionally filter by owner (Pipedrive user ID).',
+    description: 'List all open activities due within the next N days.',
     schema: z.object({
-      days:    z.number().int().min(1).max(30).default(3).describe('How many days ahead to look'),
-      user_id: z.number().int().optional().describe('Filter by Pipedrive user ID (omit for all users)'),
-      limit:   z.number().int().min(1).max(100).default(50),
+      days:  z.number().int().min(1).max(30).default(3),
+      limit: z.number().int().min(1).max(100).default(50),
     }),
-    async handler({ days, user_id, limit }) {
+    async handler({ days, limit }) {
+      const now    = new Date().toISOString().replace('T', ' ').slice(0, 19);
+      const future = dateStr(days);
+
+      const res   = await activities.getAll({ done: 0, updated_since: now, limit });
+      const all   = (res?.data?.data ?? res?.data ?? []);
+
+      // Filter to those with due_date within range
       const today  = todayStr();
-      const future = futureDateStr(days);
+      const cutoff = new Date(); cutoff.setDate(cutoff.getDate() + days);
+      const cutoffStr = cutoff.toISOString().slice(0, 10);
 
-      const params = {
-        done: 0,            // 0 = not done
-        start: 0,
-        limit,
-        start_date: today,
-        end_date: future,
-      };
-      if (user_id) params.user_id = user_id;
-
-      const res = await activitiesApi.getActivities(params);
-      const items = (res?.data ?? []).map(formatActivity);
+      const items = all
+        .filter(a => a.due_date && a.due_date >= today && a.due_date <= cutoffStr)
+        .slice(0, limit)
+        .map(formatActivity);
 
       if (items.length === 0) {
         return { content: [{ type: 'text', text: `No activities due in the next ${days} day(s).` }] };
@@ -60,7 +46,7 @@ export const activityTools = [
       return {
         content: [{
           type: 'text',
-          text: `${items.length} upcoming activity/ies in the next ${days} day(s):\n\n` +
+          text: `${items.length} activity/ies due in the next ${days} day(s):\n\n` +
             items.map(a =>
               `• [${a.due_date} ${a.due_time}] **${a.subject}** (${a.type}) — Owner: ${a.owner}${a.deal ? ` — Deal: ${a.deal}` : ''}${a.url ? `\n  ${a.url}` : ''}`
             ).join('\n'),
@@ -70,29 +56,24 @@ export const activityTools = [
     },
   },
 
-  // ── get_overdue_activities ──────────────────────────────────────────────────
   {
     name: 'get_overdue_activities',
     description: 'List all activities that are past their due date and still not completed.',
     schema: z.object({
-      user_id: z.number().int().optional().describe('Filter by user ID'),
-      limit:   z.number().int().min(1).max(100).default(50),
+      limit: z.number().int().min(1).max(100).default(50),
     }),
-    async handler({ user_id, limit }) {
+    async handler({ limit }) {
       const yesterday = new Date();
       yesterday.setDate(yesterday.getDate() - 1);
-      const yesterdayStr = yesterday.toISOString().slice(0, 10);
+      const cutoffStr = yesterday.toISOString().slice(0, 10);
 
-      const params = {
-        done:     0,
-        start:    0,
-        limit,
-        end_date: yesterdayStr,  // due before today = overdue
-      };
-      if (user_id) params.user_id = user_id;
-
-      const res = await activitiesApi.getActivities(params);
-      const items = (res?.data ?? []).map(formatActivity);
+      // Fetch not-done activities updated any time, filter by due_date < today
+      const res   = await activities.getAll({ done: 0, limit: 100 });
+      const today = todayStr();
+      const items = (res?.data?.data ?? res?.data ?? [])
+        .filter(a => a.due_date && a.due_date < today)
+        .slice(0, limit)
+        .map(formatActivity);
 
       if (items.length === 0) {
         return { content: [{ type: 'text', text: 'No overdue activities 🎉 Everyone is on track!' }] };
@@ -111,24 +92,21 @@ export const activityTools = [
     },
   },
 
-  // ── notify_upcoming_tasks ───────────────────────────────────────────────────
   {
     name: 'notify_upcoming_tasks',
-    description: 'Fetch upcoming activities and send a Microsoft Teams notification. ' +
-                 'Schedule this daily for a morning standup digest.',
+    description: 'Fetch upcoming activities and send a Microsoft Teams notification.',
     schema: z.object({
       days: z.number().int().min(1).max(14).default(1),
     }),
     async handler({ days }) {
-      const today  = todayStr();
-      const future = futureDateStr(days);
+      const today     = todayStr();
+      const cutoff    = new Date(); cutoff.setDate(cutoff.getDate() + days);
+      const cutoffStr = cutoff.toISOString().slice(0, 10);
 
-      const res = await activitiesApi.getActivities({
-        done: 0, start: 0, limit: 100,
-        start_date: today,
-        end_date: future,
-      });
-      const items = (res?.data ?? []).map(formatActivity);
+      const res   = await activities.getAll({ done: 0, limit: 100 });
+      const items = (res?.data?.data ?? res?.data ?? [])
+        .filter(a => a.due_date && a.due_date >= today && a.due_date <= cutoffStr)
+        .map(formatActivity);
 
       if (items.length === 0) {
         return { content: [{ type: 'text', text: `No upcoming tasks in ${days} day(s). No Teams alert sent.` }] };
@@ -144,20 +122,17 @@ export const activityTools = [
     },
   },
 
-  // ── notify_overdue_tasks ────────────────────────────────────────────────────
   {
     name: 'notify_overdue_tasks',
     description: 'Find all overdue activities and fire a Teams warning message.',
     schema: z.object({}),
     async handler() {
-      const yesterday = new Date();
-      yesterday.setDate(yesterday.getDate() - 1);
+      const today = todayStr();
 
-      const res = await activitiesApi.getActivities({
-        done: 0, start: 0, limit: 100,
-        end_date: yesterday.toISOString().slice(0, 10),
-      });
-      const items = (res?.data ?? []).map(formatActivity);
+      const res   = await activities.getAll({ done: 0, limit: 100 });
+      const items = (res?.data?.data ?? res?.data ?? [])
+        .filter(a => a.due_date && a.due_date < today)
+        .map(formatActivity);
 
       if (items.length === 0) {
         return { content: [{ type: 'text', text: 'No overdue tasks. No Teams alert sent.' }] };
@@ -173,66 +148,55 @@ export const activityTools = [
     },
   },
 
-  // ── create_activity ─────────────────────────────────────────────────────────
   {
     name: 'create_activity',
-    description: 'Create a new task, call, meeting, email, or deadline in Pipedrive.',
+    description: 'Create a new task, call, meeting, or deadline in Pipedrive.',
     schema: z.object({
-      subject:  z.string().describe('Short description of the activity, e.g. "Follow-up call with Acme"'),
-      type:     z.enum(['call', 'meeting', 'task', 'deadline', 'email', 'lunch']).default('task'),
-      due_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('Date in YYYY-MM-DD format'),
-      due_time: z.string().regex(/^\d{2}:\d{2}$/).optional().describe('Time in HH:MM (24h) format'),
-      deal_id:  z.number().int().optional().describe('Attach to a deal by its ID'),
-      person_id: z.number().int().optional().describe('Attach to a person by their ID'),
-      user_id:  z.number().int().optional().describe('Assign to a specific team member by user ID'),
-      note:     z.string().optional().describe('Optional notes or details'),
+      subject:   z.string().describe('Short description, e.g. "Follow-up call with Acme"'),
+      type:      z.enum(['call', 'meeting', 'task', 'deadline', 'email', 'lunch']).default('task'),
+      due_date:  z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('YYYY-MM-DD'),
+      due_time:  z.string().regex(/^\d{2}:\d{2}$/).optional().describe('HH:MM (24h)'),
+      deal_id:   z.number().int().optional(),
+      person_id: z.number().int().optional(),
+      user_id:   z.number().int().optional().describe('Assign to a specific team member'),
+      note:      z.string().optional(),
     }),
     async handler(args) {
-      const payload = {
-        subject:   args.subject,
-        type:      args.type,
-        due_date:  args.due_date,
+      const body = {
+        subject:  args.subject,
+        type:     args.type,
+        due_date: args.due_date,
+        done:     false,
         ...(args.due_time  && { due_time:  args.due_time }),
         ...(args.deal_id   && { deal_id:   args.deal_id }),
         ...(args.person_id && { person_id: args.person_id }),
         ...(args.user_id   && { user_id:   args.user_id }),
         ...(args.note      && { note:      args.note }),
-        done: false,
       };
 
-      const res = await activitiesApi.addActivity({ AddActivityRequest: payload });
-      const a = res?.data;
+      const res = await activities.create(body);
+      const a   = res?.data?.data ?? res?.data;
 
       if (!a) throw new Error('Failed to create activity — no data returned.');
 
       return {
         content: [{
           type: 'text',
-          text: `✅ Activity created!\n` +
-                `• Subject: ${a.subject}\n` +
-                `• Type: ${a.type}\n` +
-                `• Due: ${a.due_date}${a.due_time ? ' ' + a.due_time : ''}\n` +
-                `• ID: ${a.id}`,
+          text: `✅ Activity created!\n• Subject: ${a.subject}\n• Type: ${a.type}\n• Due: ${a.due_date}${a.due_time ? ' ' + a.due_time : ''}\n• ID: ${a.id}`,
         }],
       };
     },
   },
 
-  // ── mark_activity_done ──────────────────────────────────────────────────────
   {
     name: 'mark_activity_done',
     description: 'Mark a Pipedrive activity as completed.',
     schema: z.object({
-      activity_id: z.number().int().describe('The numeric ID of the activity'),
+      activity_id: z.number().int(),
     }),
     async handler({ activity_id }) {
-      await activitiesApi.updateActivity({
-        id: activity_id,
-        UpdateActivityRequest: { done: true },
-      });
-      return {
-        content: [{ type: 'text', text: `✅ Activity ${activity_id} marked as done.` }],
-      };
+      await activities.update(activity_id, { done: true });
+      return { content: [{ type: 'text', text: `✅ Activity ${activity_id} marked as done.` }] };
     },
   },
 ];

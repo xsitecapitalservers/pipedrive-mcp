@@ -1,31 +1,23 @@
 /**
  * tools/reports.js — Reports & Dashboards
- * ─────────────────────────────────────────────
- * Tools:
- *   generate_pipeline_report  - full pipeline snapshot sent to Teams
- *   generate_activity_report  - team activity completion rates
- *   generate_weekly_digest    - all-in-one weekly summary to Teams
- *   get_deals_closing_soon    - deals with close dates in the next N days
  */
 
-import { dealsApi, activitiesApi, fetchAll, formatDeal, formatActivity } from '../pipedrive.js';
+import { deals, activities, fetchAll, formatDeal } from '../pipedrive.js';
 import { notifyPipelineReport, notifyCustom } from '../teams.js';
 import { z } from 'zod';
 
 export const reportTools = [
 
-  // ── generate_pipeline_report ─────────────────────────────────────────────────
   {
     name: 'generate_pipeline_report',
-    description: 'Generate a full pipeline snapshot and optionally send it to Teams. ' +
-                 'Great for end-of-week or Monday morning reports.',
+    description: 'Generate a full pipeline snapshot and optionally send it to Teams.',
     schema: z.object({
-      send_to_teams:    z.boolean().default(true).describe('Also post the report to Microsoft Teams'),
+      send_to_teams:    z.boolean().default(true),
       stale_after_days: z.number().int().default(14),
     }),
     async handler({ send_to_teams, stale_after_days }) {
-      const allDeals = await fetchAll(({ start, limit }) =>
-        dealsApi.getDeals({ status: 'open', start, limit })
+      const allDeals = await fetchAll((cursor) =>
+        deals.getAll({ status: 'open', limit: 100, cursor })
       );
 
       const totalValue = allDeals.reduce((s, d) => s + (Number(d.value) || 0), 0);
@@ -34,28 +26,23 @@ export const reportTools = [
 
       const staleThreshold = new Date();
       staleThreshold.setDate(staleThreshold.getDate() - stale_after_days);
-      const staleStr = staleThreshold.toISOString().slice(0, 10);
+      const staleStr   = staleThreshold.toISOString().slice(0, 10);
       const staleCount = allDeals.filter(d => !d.last_activity_date || d.last_activity_date < staleStr).length;
 
-      const yesterday = new Date();
-      yesterday.setDate(yesterday.getDate() - 1);
-      const overdueRes = await activitiesApi.getActivities({
-        done: 0, start: 0, limit: 100,
-        end_date: yesterday.toISOString().slice(0, 10),
-      });
-      const overdueCount = overdueRes?.data?.length ?? 0;
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const actsRes  = await activities.getAll({ done: 0, limit: 100 });
+      const overdueCount = (actsRes?.data?.data ?? actsRes?.data ?? [])
+        .filter(a => a.due_date && a.due_date < todayStr).length;
 
-      // Won/Lost this month
-      const monthStart = new Date();
-      monthStart.setDate(1);
-      const monthStr = monthStart.toISOString().slice(0, 10);
+      const monthStart = new Date(); monthStart.setDate(1);
+      const monthStr   = monthStart.toISOString().replace('T', ' ').slice(0, 19);
 
       const [wonRes, lostRes] = await Promise.all([
-        dealsApi.getDeals({ status: 'won',  limit: 100 }),
-        dealsApi.getDeals({ status: 'lost', limit: 100 }),
+        deals.getAll({ status: 'won',  updated_since: monthStr, limit: 100 }),
+        deals.getAll({ status: 'lost', updated_since: monthStr, limit: 100 }),
       ]);
-      const wonMonth  = (wonRes?.data  ?? []).filter(d => (d.won_time  ?? '') >= monthStr).length;
-      const lostMonth = (lostRes?.data ?? []).filter(d => (d.lost_time ?? '') >= monthStr).length;
+      const wonMonth  = (wonRes?.data?.data  ?? wonRes?.data  ?? []).length;
+      const lostMonth = (lostRes?.data?.data ?? lostRes?.data ?? []).length;
 
       const summary = {
         open_deals:         allDeals.length,
@@ -67,8 +54,9 @@ export const reportTools = [
         stale_deals:        staleCount,
       };
 
+      const dateStr = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
       const reportText =
-        `📊 **Pipeline Report — ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}**\n\n` +
+        `📊 **Pipeline Report — ${dateStr}**\n\n` +
         `• Open deals:            ${allDeals.length}\n` +
         `• Total pipeline value:  ${currency} ${totalValue.toLocaleString()}\n` +
         `• Average deal size:     ${currency} ${avgValue.toLocaleString()}\n` +
@@ -78,21 +66,17 @@ export const reportTools = [
         `• Overdue activities:    ${overdueCount}`;
 
       let teamsResult = { sent: false, reason: 'send_to_teams=false' };
-      if (send_to_teams) {
-        teamsResult = await notifyPipelineReport(summary);
-      }
+      if (send_to_teams) teamsResult = await notifyPipelineReport(summary);
 
       return {
         content: [{
           type: 'text',
-          text: reportText +
-            `\n\nTeams notification: ${teamsResult.sent ? 'sent ✅' : 'skipped (' + teamsResult.reason + ')'}`,
+          text: reportText + `\n\nTeams: ${teamsResult.sent ? 'sent ✅' : 'skipped (' + teamsResult.reason + ')'}`,
         }],
       };
     },
   },
 
-  // ── generate_activity_report ─────────────────────────────────────────────────
   {
     name: 'generate_activity_report',
     description: 'Show how many activities were completed vs overdue over the last N days.',
@@ -100,71 +84,68 @@ export const reportTools = [
       days: z.number().int().min(1).max(30).default(7),
     }),
     async handler({ days }) {
-      const cutoff = new Date();
-      cutoff.setDate(cutoff.getDate() - days);
-      const cutoffStr = cutoff.toISOString().slice(0, 10);
+      const cutoff    = new Date(); cutoff.setDate(cutoff.getDate() - days);
+      const cutoffStr = cutoff.toISOString().replace('T', ' ').slice(0, 19);
+      const todayStr  = new Date().toISOString().slice(0, 10);
 
-      const [doneRes, overdueRes] = await Promise.all([
-        activitiesApi.getActivities({ done: 1, start: 0, limit: 100, start_date: cutoffStr }),
-        activitiesApi.getActivities({ done: 0, start: 0, limit: 100, end_date: cutoffStr }),
+      const [doneRes, openRes] = await Promise.all([
+        activities.getAll({ done: 1, updated_since: cutoffStr, limit: 100 }),
+        activities.getAll({ done: 0, limit: 100 }),
       ]);
 
-      const done    = doneRes?.data ?? [];
-      const overdue = overdueRes?.data ?? [];
+      const done    = doneRes?.data?.data ?? doneRes?.data ?? [];
+      const overdue = (openRes?.data?.data ?? openRes?.data ?? [])
+        .filter(a => a.due_date && a.due_date < todayStr);
 
-      // Group completed by type
       const byType = {};
-      for (const a of done) {
-        byType[a.type ?? 'other'] = (byType[a.type ?? 'other'] ?? 0) + 1;
-      }
+      for (const a of done) { byType[a.type ?? 'other'] = (byType[a.type ?? 'other'] ?? 0) + 1; }
       const typeBreakdown = Object.entries(byType)
         .sort((a, b) => b[1] - a[1])
-        .map(([type, count]) => `  • ${type}: ${count}`)
+        .map(([t, n]) => `  • ${t}: ${n}`)
         .join('\n');
+
+      const total = done.length + overdue.length;
 
       return {
         content: [{
           type: 'text',
           text:
             `📋 **Activity Report (last ${days} days)**\n\n` +
-            `• Completed activities: ${done.length}\n` +
-            `• Still overdue:        ${overdue.length}\n` +
-            `• Completion rate:      ${done.length + overdue.length > 0
-              ? ((done.length / (done.length + overdue.length)) * 100).toFixed(0) + '%'
-              : 'n/a'}\n\n` +
+            `• Completed:      ${done.length}\n` +
+            `• Still overdue:  ${overdue.length}\n` +
+            `• Completion rate: ${total > 0 ? ((done.length / total) * 100).toFixed(0) + '%' : 'n/a'}\n\n` +
             (typeBreakdown ? `**Completed by type:**\n${typeBreakdown}` : ''),
         }],
       };
     },
   },
 
-  // ── generate_weekly_digest ───────────────────────────────────────────────────
   {
     name: 'generate_weekly_digest',
-    description: 'Generate and send a comprehensive weekly digest to Teams: new leads, ' +
-                 'upcoming tasks, pipeline health, and win/loss stats all in one message.',
+    description: 'Comprehensive weekly digest sent to Teams: new leads, tasks, pipeline health, and wins.',
     schema: z.object({}),
     async handler() {
-      const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-      const weekAgo   = new Date(); weekAgo.setDate(weekAgo.getDate() - 7);
-      const weekAgoStr = weekAgo.toISOString().slice(0, 10);
-
+      const dateStr  = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+      const weekAgo  = new Date(); weekAgo.setDate(weekAgo.getDate() - 7);
+      const weekAgoISO = weekAgo.toISOString().replace('T', ' ').slice(0, 19);
+      const weekAgoDate = weekAgo.toISOString().slice(0, 10);
+      const today    = new Date().toISOString().slice(0, 10);
       const nextWeek = new Date(); nextWeek.setDate(nextWeek.getDate() + 7);
-      const nextWeekStr = nextWeek.toISOString().slice(0, 10);
+      const nextWeekDate = nextWeek.toISOString().slice(0, 10);
 
-      const [newDealsRes, upcomingRes, overdueRes, wonRes, openDealsData] = await Promise.all([
-        dealsApi.getDeals({ status: 'open', sort: 'add_time DESC', limit: 50 }),
-        activitiesApi.getActivities({ done: 0, start: 0, limit: 50, start_date: new Date().toISOString().slice(0,10), end_date: nextWeekStr }),
-        activitiesApi.getActivities({ done: 0, start: 0, limit: 50, end_date: weekAgoStr }),
-        dealsApi.getDeals({ status: 'won', limit: 50 }),
-        fetchAll(({ start, limit }) => dealsApi.getDeals({ status: 'open', start, limit })),
+      const [newDealsRes, wonRes, openDeals, actsRes] = await Promise.all([
+        deals.getAll({ status: 'open', updated_since: weekAgoISO, sort_by: 'id', sort_direction: 'desc', limit: 50 }),
+        deals.getAll({ status: 'won',  updated_since: weekAgoISO, limit: 50 }),
+        fetchAll((cursor) => deals.getAll({ status: 'open', limit: 100, cursor })),
+        activities.getAll({ done: 0, limit: 100 }),
       ]);
 
-      const newDeals  = (newDealsRes?.data ?? []).filter(d => d.add_time?.slice(0,10) >= weekAgoStr);
-      const upcoming  = upcomingRes?.data ?? [];
-      const overdue   = overdueRes?.data ?? [];
-      const wonWeek   = (wonRes?.data ?? []).filter(d => (d.won_time ?? '') >= weekAgoStr);
-      const openDeals = openDealsData;
+      const newDeals = (newDealsRes?.data?.data ?? newDealsRes?.data ?? [])
+        .filter(d => d.add_time?.slice(0, 10) >= weekAgoDate);
+      const wonWeek  = wonRes?.data?.data ?? wonRes?.data ?? [];
+      const allActs  = actsRes?.data?.data ?? actsRes?.data ?? [];
+      const upcoming = allActs.filter(a => a.due_date && a.due_date >= today && a.due_date <= nextWeekDate);
+      const overdue  = allActs.filter(a => a.due_date && a.due_date < today);
 
       const totalValue = openDeals.reduce((s, d) => s + (Number(d.value) || 0), 0);
       const currency   = openDeals[0]?.currency ?? '';
@@ -177,29 +158,27 @@ export const reportTools = [
         `**Overdue tasks:** ${overdue.length}\n\n` +
         `[View full pipeline →](https://app.pipedrive.com/deals)`;
 
-      const teamsResult = await notifyCustom(`📅 Weekly Digest — ${today}`, body, 'Accent');
+      const teamsResult = await notifyCustom(`📅 Weekly Digest — ${dateStr}`, body, 'Accent');
 
       return {
         content: [{
           type: 'text',
           text:
-            `Weekly digest generated for ${today}:\n\n` +
+            `Weekly digest for ${dateStr}:\n\n` +
             `• New leads:   ${newDeals.length}\n` +
             `• Won deals:   ${wonWeek.length}\n` +
             `• Open deals:  ${openDeals.length} (${currency} ${totalValue.toLocaleString()})\n` +
             `• Upcoming:    ${upcoming.length} tasks\n` +
             `• Overdue:     ${overdue.length} tasks\n\n` +
-            `Teams notification: ${teamsResult.sent ? 'sent ✅' : 'skipped (' + teamsResult.reason + ')'}`,
+            `Teams: ${teamsResult.sent ? 'sent ✅' : 'skipped (' + teamsResult.reason + ')'}`,
         }],
       };
     },
   },
 
-  // ── get_deals_closing_soon ───────────────────────────────────────────────────
   {
     name: 'get_deals_closing_soon',
-    description: 'List open deals whose expected close date falls within the next N days. ' +
-                 'Useful for spotting deals that need attention before they lapse.',
+    description: 'List open deals whose expected close date falls within the next N days.',
     schema: z.object({
       days:  z.number().int().min(1).max(60).default(14),
       limit: z.number().int().min(1).max(50).default(20),
@@ -209,14 +188,14 @@ export const reportTools = [
       const future  = new Date(); future.setDate(future.getDate() + days);
       const futureStr = future.toISOString().slice(0, 10);
 
-      const allOpen = await fetchAll(({ start, limit: l }) =>
-        dealsApi.getDeals({ status: 'open', start, limit: l })
+      const allOpen = await fetchAll((cursor) =>
+        deals.getAll({ status: 'open', limit: 100, cursor })
       );
 
       const closing = allOpen
         .filter(d => {
           const date = d.expected_close_date ?? d.close_time;
-          return date && date >= today && date <= futureStr;
+          return date && date >= today && date.slice(0, 10) <= futureStr;
         })
         .sort((a, b) => {
           const da = a.expected_close_date ?? a.close_time ?? '';

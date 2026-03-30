@@ -1,42 +1,27 @@
 /**
  * tools/leads.js — New Lead Alerts
- * ─────────────────────────────────────────────
- * Tools:
- *   get_new_leads       - list deals/leads created in the last N days
- *   notify_new_leads    - send a Teams alert about new leads
- *   get_recent_deals    - deals updated recently (won, lost, or moved stage)
  */
 
-import { dealsApi, leadsApi, fetchAll, formatDeal } from '../pipedrive.js';
+import { deals, fetchAll, formatDeal } from '../pipedrive.js';
 import { notifyNewLeads } from '../teams.js';
 import { z } from 'zod';
 
 export const leadTools = [
 
-  // ── get_new_leads ───────────────────────────────────────────────────────────
   {
     name: 'get_new_leads',
-    description: 'Get deals and leads that were created in Pipedrive within the last N days. ' +
-                 'Useful for a morning briefing or a "what came in" alert.',
+    description: 'Get deals created in Pipedrive within the last N days.',
     schema: z.object({
-      days: z.number().int().min(1).max(90).default(1)
-        .describe('How many days back to look (default: 1, meaning "since yesterday")'),
-      limit: z.number().int().min(1).max(100).default(25)
-        .describe('Maximum number of results to return'),
+      days:  z.number().int().min(1).max(90).default(1).describe('How many days back to look'),
+      limit: z.number().int().min(1).max(100).default(25),
     }),
     async handler({ days, limit }) {
       const cutoff = new Date();
       cutoff.setDate(cutoff.getDate() - days);
-      const cutoffStr = cutoff.toISOString().slice(0, 10); // YYYY-MM-DD
+      const cutoffStr = cutoff.toISOString().slice(0, 10);
 
-      const res = await dealsApi.getDeals({
-        status: 'open',
-        sort: 'add_time DESC',
-        start: 0,
-        limit: 100,
-      });
-
-      const all = res?.data ?? [];
+      const res  = await deals.getAll({ status: 'open', sort_by: 'id', sort_direction: 'desc', limit: 100 });
+      const all  = (res?.data?.data ?? res?.data ?? []);
       const filtered = all
         .filter(d => d.add_time && d.add_time.slice(0, 10) >= cutoffStr)
         .slice(0, limit)
@@ -52,28 +37,24 @@ export const leadTools = [
                 `• **${d.title}** (${d.value}) — Stage: ${d.stage} — Owner: ${d.owner}\n  ${d.url}`
               ).join('\n'),
         }],
-        // also return structured data so other tools can consume it
         _data: filtered,
       };
     },
   },
 
-  // ── notify_new_leads ────────────────────────────────────────────────────────
   {
     name: 'notify_new_leads',
-    description: 'Fetch new deals from the last N days AND send a Microsoft Teams notification ' +
-                 'to your configured channel. Great for a scheduled morning alert.',
+    description: 'Fetch new deals from the last N days AND send a Microsoft Teams notification.',
     schema: z.object({
-      days: z.number().int().min(1).max(30).default(1)
-        .describe('How many days back to look'),
+      days: z.number().int().min(1).max(30).default(1),
     }),
     async handler({ days }) {
       const cutoff = new Date();
       cutoff.setDate(cutoff.getDate() - days);
       const cutoffStr = cutoff.toISOString().slice(0, 10);
 
-      const res = await dealsApi.getDeals({ status: 'open', sort: 'add_time DESC', limit: 50 });
-      const all = (res?.data ?? [])
+      const res = await deals.getAll({ status: 'open', sort_by: 'id', sort_direction: 'desc', limit: 50 });
+      const all = (res?.data?.data ?? res?.data ?? [])
         .filter(d => d.add_time?.slice(0, 10) >= cutoffStr)
         .map(formatDeal);
 
@@ -91,31 +72,27 @@ export const leadTools = [
     },
   },
 
-  // ── get_recent_deals ────────────────────────────────────────────────────────
   {
     name: 'get_recent_deals',
     description: 'Get deals that were updated (moved stage, won, or lost) in the last N days.',
     schema: z.object({
-      days:   z.number().int().min(1).max(90).default(7).describe('Days back to look'),
-      status: z.enum(['open', 'won', 'lost', 'all']).default('all').describe('Filter by deal status'),
+      days:   z.number().int().min(1).max(90).default(7),
+      status: z.enum(['open', 'won', 'lost']).default('open'),
       limit:  z.number().int().min(1).max(100).default(25),
     }),
     async handler({ days, status, limit }) {
       const cutoff = new Date();
       cutoff.setDate(cutoff.getDate() - days);
-      const cutoffStr = cutoff.toISOString().slice(0, 10);
+      const cutoffStr = cutoff.toISOString().replace('T', ' ').slice(0, 19); // YYYY-MM-DD HH:MM:SS
 
-      const apiStatus = status === 'all' ? undefined : status;
-      const res = await dealsApi.getDeals({
-        status: apiStatus,
-        sort: 'update_time DESC',
-        limit: 100,
+      const res = await deals.getAll({
+        status,
+        updated_since: cutoffStr,
+        sort_by: 'update_time',
+        sort_direction: 'desc',
+        limit: Math.min(limit, 100),
       });
-
-      const filtered = (res?.data ?? [])
-        .filter(d => d.update_time?.slice(0, 10) >= cutoffStr)
-        .slice(0, limit)
-        .map(formatDeal);
+      const filtered = (res?.data?.data ?? res?.data ?? []).slice(0, limit).map(formatDeal);
 
       if (filtered.length === 0) {
         return { content: [{ type: 'text', text: `No deals updated in the last ${days} day(s).` }] };
