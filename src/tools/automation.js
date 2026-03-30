@@ -1,8 +1,4 @@
-/**
- * tools/automation.js — Task Automation
- */
-
-import { deals, pipelines, stages, users, notes, formatDeal } from '../pipedrive.js';
+import { deals, pipelines, stages, users, notes, getData, formatDeal } from '../pipedrive.js';
 import { z } from 'zod';
 
 export const automationTools = [
@@ -13,22 +9,18 @@ export const automationTools = [
     schema: z.object({}),
     async handler() {
       const res      = await pipelines.getAll();
-      const allPipes = res?.data?.data ?? res?.data ?? [];
-
+      const allPipes = getData(res);
       if (allPipes.length === 0) {
         return { content: [{ type: 'text', text: 'No pipelines found.' }] };
       }
-
       const lines = [];
       for (const p of allPipes) {
         lines.push(`\n**Pipeline: ${p.name}** (ID: ${p.id})`);
         const stagesRes = await stages.getAll(p.id);
-        const stageList = stagesRes?.data?.data ?? stagesRes?.data ?? [];
-        for (const s of stageList) {
+        for (const s of getData(stagesRes)) {
           lines.push(`  Stage ID ${s.id}: ${s.name}`);
         }
       }
-
       return { content: [{ type: 'text', text: 'Your pipelines and stages:\n' + lines.join('\n') }] };
     },
   },
@@ -38,18 +30,15 @@ export const automationTools = [
     description: 'List all active Pipedrive team members with their IDs.',
     schema: z.object({}),
     async handler() {
-      const res       = await users.getAll();
-      const allUsers  = (res?.data?.data ?? res?.data ?? []).filter(u => u.active_flag);
-
+      const res      = await users.getAll();
+      const allUsers = getData(res).filter(u => u.active_flag);
       if (allUsers.length === 0) {
         return { content: [{ type: 'text', text: 'No active users found.' }] };
       }
-
       return {
         content: [{
           type: 'text',
-          text: 'Active team members:\n\n' +
-            allUsers.map(u => `• ID ${u.id} — ${u.name} (${u.email})`).join('\n'),
+          text: 'Active team members:\n\n' + allUsers.map(u => `• ID ${u.id} — ${u.name} (${u.email})`).join('\n'),
         }],
       };
     },
@@ -64,10 +53,8 @@ export const automationTools = [
     }),
     async handler({ deal_id, stage_id }) {
       const res = await deals.update(deal_id, { stage_id });
-      const d   = res?.data?.data ?? res?.data;
-
+      const d   = res?.data ?? getData(res)?.[0];
       if (!d) throw new Error('Update failed — no data returned.');
-
       return {
         content: [{
           type: 'text',
@@ -85,11 +72,9 @@ export const automationTools = [
       user_id: z.number().int(),
     }),
     async handler({ deal_id, user_id }) {
-      const res = await deals.update(deal_id, { owner_id: user_id });
-      const d   = res?.data?.data ?? res?.data;
-
+      const res = await deals.update(deal_id, { user_id });
+      const d   = res?.data ?? getData(res)?.[0];
       if (!d) throw new Error('Update failed.');
-
       return {
         content: [{
           type: 'text',
@@ -107,17 +92,13 @@ export const automationTools = [
       stage_id: z.number().int(),
     }),
     async handler({ deal_ids, stage_id }) {
-      const results = await Promise.allSettled(
-        deal_ids.map(id => deals.update(id, { stage_id }))
-      );
-
-      const ok     = results.filter(r => r.status === 'fulfilled').length;
-      const failed = results.filter(r => r.status === 'rejected').length;
-
+      const results = await Promise.allSettled(deal_ids.map(id => deals.update(id, { stage_id })));
+      const ok      = results.filter(r => r.status === 'fulfilled').length;
+      const failed  = results.filter(r => r.status === 'rejected').length;
       return {
         content: [{
           type: 'text',
-          text: `Bulk update complete.\n✅ ${ok} deal(s) moved to stage ${stage_id}${failed > 0 ? `\n❌ ${failed} deal(s) failed` : ''}`,
+          text: `Bulk update complete.\n✅ ${ok} deal(s) moved to stage ${stage_id}${failed > 0 ? `\n❌ ${failed} failed` : ''}`,
         }],
       };
     },
@@ -128,20 +109,13 @@ export const automationTools = [
     description: 'Add a text note to a deal in Pipedrive.',
     schema: z.object({
       deal_id: z.number().int(),
-      content: z.string().min(1).describe('The note text'),
+      content: z.string().min(1),
     }),
     async handler({ deal_id, content }) {
       const res  = await notes.create({ content, deal_id });
-      const note = res?.data?.data ?? res?.data;
-
+      const note = res?.data ?? getData(res)?.[0];
       if (!note) throw new Error('Note creation failed.');
-
-      return {
-        content: [{
-          type: 'text',
-          text: `✅ Note added to deal ${deal_id} (note ID: ${note.id})`,
-        }],
-      };
+      return { content: [{ type: 'text', text: `✅ Note added to deal ${deal_id} (note ID: ${note.id})` }] };
     },
   },
 
@@ -155,19 +129,15 @@ export const automationTools = [
     }),
     async handler({ query, status, limit }) {
       const res   = await deals.search(query, { status, limit });
-      const items = (res?.data?.data?.items ?? res?.data?.items ?? []).map(i => formatDeal(i.item ?? i));
-
+      const items = (res?.data?.items ?? getData(res) ?? []).map(i => formatDeal(i.item ?? i));
       if (items.length === 0) {
         return { content: [{ type: 'text', text: `No deals found matching "${query}".` }] };
       }
-
       return {
         content: [{
           type: 'text',
           text: `${items.length} deal(s) found for "${query}":\n\n` +
-            items.map(d =>
-              `• ID ${d.id} — **${d.title}** | ${d.value} | Stage: ${d.stage} | Owner: ${d.owner}\n  ${d.url}`
-            ).join('\n'),
+            items.map(d => `• ID ${d.id} — **${d.title}** | ${d.value} | Owner: ${d.owner}\n  ${d.url}`).join('\n'),
         }],
       };
     },

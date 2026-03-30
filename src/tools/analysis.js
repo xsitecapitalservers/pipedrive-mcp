@@ -1,8 +1,4 @@
-/**
- * tools/analysis.js — Pipeline & Sales Analysis
- */
-
-import { deals, activities, stages, pipelines, users, fetchAll, formatDeal } from '../pipedrive.js';
+import { deals, activities, stages, pipelines, users, fetchAll, getData, formatDeal } from '../pipedrive.js';
 import { z } from 'zod';
 
 export const analysisTools = [
@@ -15,10 +11,9 @@ export const analysisTools = [
       stale_after_days: z.number().int().min(1).max(180).default(14),
     }),
     async handler({ pipeline_id, stale_after_days }) {
-      const allDeals = await fetchAll((cursor) =>
-        deals.getAll({ status: 'open', pipeline_id, limit: 100, cursor })
+      const allDeals = await fetchAll((opts) =>
+        deals.getAll({ ...opts, status: 'open', ...(pipeline_id && { pipeline_id }) })
       );
-
       if (allDeals.length === 0) {
         return { content: [{ type: 'text', text: 'No open deals found.' }] };
       }
@@ -27,28 +22,21 @@ export const analysisTools = [
       const avgValue   = Math.round(totalValue / allDeals.length);
       const currency   = allDeals[0]?.currency ?? '';
 
-      const staleThreshold = new Date();
-      staleThreshold.setDate(staleThreshold.getDate() - stale_after_days);
-      const staleStr    = staleThreshold.toISOString().slice(0, 10);
+      const staleDate = new Date(); staleDate.setDate(staleDate.getDate() - stale_after_days);
+      const staleStr  = staleDate.toISOString().slice(0, 10);
       const staleDeals  = allDeals.filter(d => !d.last_activity_date || d.last_activity_date < staleStr);
       const noCloseDate = allDeals.filter(d => !d.expected_close_date);
 
       const byStage = {};
       for (const d of allDeals) {
-        const s = d.stage_name ?? `Stage ${d.stage_id}` ?? 'Unknown';
+        const s = `Stage ${d.stage_id}`;
         byStage[s] = (byStage[s] ?? 0) + 1;
       }
-      const stageBreakdown = Object.entries(byStage)
-        .sort((a, b) => b[1] - a[1])
-        .map(([s, n]) => `  ${s}: ${n}`)
-        .join('\n');
+      const stageBreakdown = Object.entries(byStage).sort((a,b)=>b[1]-a[1]).map(([s,n])=>`  ${s}: ${n}`).join('\n');
 
-      const today = new Date();
-      today.setDate(today.getDate() - 1);
-      const overdueRes = await activities.getAll({ done: 0, limit: 100 });
-      const todayStr   = new Date().toISOString().slice(0, 10);
-      const overdueCount = (overdueRes?.data?.data ?? overdueRes?.data ?? [])
-        .filter(a => a.due_date && a.due_date < todayStr).length;
+      const today    = new Date().toISOString().slice(0, 10);
+      const actsRes  = await activities.getAll({ done: 0, limit: 100 });
+      const overdueCount = getData(actsRes).filter(a => a.due_date && a.due_date < today).length;
 
       return {
         content: [{
@@ -63,10 +51,7 @@ export const analysisTools = [
             `• Overdue activities: ${overdueCount}\n\n` +
             `**By Stage:**\n${stageBreakdown}` +
             (staleDeals.length > 0
-              ? `\n\n**Top stale deals:**\n` +
-                staleDeals.slice(0, 5).map(d =>
-                  `  • ${d.title} (last activity: ${d.last_activity_date ?? 'never'})`
-                ).join('\n')
+              ? `\n\n**Top stale deals:**\n` + staleDeals.slice(0, 5).map(d => `  • ${d.title} (last activity: ${d.last_activity_date ?? 'never'})`).join('\n')
               : ''),
         }],
       };
@@ -80,17 +65,16 @@ export const analysisTools = [
       months: z.number().int().min(1).max(24).default(3),
     }),
     async handler({ months }) {
-      const cutoff = new Date();
-      cutoff.setMonth(cutoff.getMonth() - months);
-      const cutoffStr = cutoff.toISOString().replace('T', ' ').slice(0, 19);
-
       const [wonRes, lostRes] = await Promise.all([
-        deals.getAll({ status: 'won',  updated_since: cutoffStr, limit: 100 }),
-        deals.getAll({ status: 'lost', updated_since: cutoffStr, limit: 100 }),
+        deals.getAll({ status: 'won',  limit: 100, sort: 'update_time DESC' }),
+        deals.getAll({ status: 'lost', limit: 100, sort: 'update_time DESC' }),
       ]);
 
-      const won  = wonRes?.data?.data  ?? wonRes?.data  ?? [];
-      const lost = lostRes?.data?.data ?? lostRes?.data ?? [];
+      const cutoff = new Date(); cutoff.setMonth(cutoff.getMonth() - months);
+      const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+      const won  = getData(wonRes).filter(d  => (d.won_time  ?? d.update_time ?? '') >= cutoffStr);
+      const lost = getData(lostRes).filter(d => (d.lost_time ?? d.update_time ?? '') >= cutoffStr);
 
       const total   = won.length + lost.length;
       const winRate = total > 0 ? ((won.length / total) * 100).toFixed(1) : 'n/a';
@@ -99,23 +83,15 @@ export const analysisTools = [
       const avgWon    = won.length > 0 ? Math.round(wonValue / won.length) : 0;
 
       const lossReasons = {};
-      for (const d of lost) {
-        const r = d.lost_reason ?? 'Unspecified';
-        lossReasons[r] = (lossReasons[r] ?? 0) + 1;
-      }
-      const lossBreakdown = Object.entries(lossReasons)
-        .sort((a, b) => b[1] - a[1])
-        .map(([r, n]) => `  • ${r}: ${n}`)
-        .join('\n');
+      for (const d of lost) { const r = d.lost_reason ?? 'Unspecified'; lossReasons[r] = (lossReasons[r] ?? 0) + 1; }
+      const lossBreakdown = Object.entries(lossReasons).sort((a,b)=>b[1]-a[1]).map(([r,n])=>`  • ${r}: ${n}`).join('\n');
 
       return {
         content: [{
           type: 'text',
           text:
             `📈 **Win/Loss Analysis (last ${months} month(s))**\n\n` +
-            `• Won deals:       ${won.length}\n` +
-            `• Lost deals:      ${lost.length}\n` +
-            `• Win rate:        ${winRate}%\n` +
+            `• Won: ${won.length} | Lost: ${lost.length} | Win rate: ${winRate}%\n` +
             `• Total won value: ${currency} ${wonValue.toLocaleString()}\n` +
             `• Avg won deal:    ${currency} ${avgWon.toLocaleString()}\n\n` +
             (lost.length > 0 ? `**Loss reasons:**\n${lossBreakdown}` : ''),
@@ -134,23 +110,23 @@ export const analysisTools = [
       let pid = pipeline_id;
       if (!pid) {
         const res = await pipelines.getAll();
-        pid = (res?.data?.data ?? res?.data ?? [])[0]?.id;
+        pid = getData(res)[0]?.id;
       }
       if (!pid) throw new Error('No pipeline found.');
 
       const [stagesRes, allDeals] = await Promise.all([
         stages.getAll(pid),
-        fetchAll((cursor) => deals.getAll({ status: 'open', pipeline_id: pid, limit: 100, cursor })),
+        fetchAll((opts) => deals.getAll({ ...opts, status: 'open', pipeline_id: pid })),
       ]);
 
-      const stageList = stagesRes?.data?.data ?? stagesRes?.data ?? [];
+      const stageList = getData(stagesRes);
       if (stageList.length === 0) return { content: [{ type: 'text', text: 'No stages found.' }] };
 
       const lines = stageList.map(s => {
         const count = allDeals.filter(d => d.stage_id === s.id).length;
         const bar   = '█'.repeat(Math.min(count, 30));
         const pct   = allDeals.length > 0 ? ((count / allDeals.length) * 100).toFixed(0) : 0;
-        return `  ${String(s.order_nr ?? '').padEnd(2)} ${s.name.padEnd(25)} ${bar} ${count} (${pct}%)`;
+        return `  ${s.name.padEnd(25)} ${bar} ${count} (${pct}%)`;
       });
 
       return {
@@ -169,15 +145,15 @@ export const analysisTools = [
     async handler() {
       const [usersRes, allDeals, actsRes] = await Promise.all([
         users.getAll(),
-        fetchAll((cursor) => deals.getAll({ status: 'open', limit: 100, cursor })),
+        fetchAll((opts) => deals.getAll({ ...opts, status: 'open' })),
         activities.getAll({ done: 0, limit: 100 }),
       ]);
 
-      const allUsers = (usersRes?.data?.data ?? usersRes?.data ?? []).filter(u => u.active_flag);
-      const acts     = actsRes?.data?.data ?? actsRes?.data ?? [];
+      const allUsers = getData(usersRes).filter(u => u.active_flag);
+      const acts     = getData(actsRes);
 
       const rows = allUsers.map(u => {
-        const userDeals = allDeals.filter(d => d.owner_id === u.id || d.user_id?.id === u.id);
+        const userDeals = allDeals.filter(d => d.user_id?.id === u.id || d.user_id === u.id);
         const userActs  = acts.filter(a => a.user_id === u.id || a.assigned_to_user_id === u.id);
         const value     = userDeals.reduce((s, d) => s + (Number(d.value) || 0), 0);
         const currency  = userDeals[0]?.currency ?? '';

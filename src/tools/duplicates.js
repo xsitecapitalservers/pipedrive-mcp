@@ -1,14 +1,9 @@
-/**
- * tools/duplicates.js — Duplicate Detection & Merging
- */
-
-import { persons, organizations, fetchAll, formatPerson } from '../pipedrive.js';
+import { persons, organizations, fetchAll, getData, formatPerson } from '../pipedrive.js';
 import { z } from 'zod';
 
 function normalise(str = '') {
   return str.toLowerCase().trim().replace(/\s+/g, ' ');
 }
-
 function groupBy(items, keyFn) {
   const groups = new Map();
   for (const item of items) {
@@ -30,25 +25,20 @@ export const duplicateTools = [
       max_groups: z.number().int().min(1).max(50).default(20),
     }),
     async handler({ match_by, max_groups }) {
-      const allPersons = await fetchAll((cursor) =>
-        persons.getAll({ limit: 100, cursor })
-      );
-
+      const allPersons = await fetchAll((opts) => persons.getAll(opts));
       const groups = [];
 
       if (match_by === 'name' || match_by === 'both') {
         groups.push(...groupBy(allPersons, p => normalise(p.name)));
       }
-
       if (match_by === 'email' || match_by === 'both') {
         const byEmail = groupBy(allPersons, p => {
-          const email = p.emails?.[0]?.value ?? p.email?.[0]?.value;
+          const email = p.email?.[0]?.value;
           return email ? normalise(email) : null;
         });
         for (const g of byEmail) {
           const ids = new Set(g.map(p => p.id));
-          const already = groups.some(ex => ex.some(p => ids.has(p.id)));
-          if (!already) groups.push(g);
+          if (!groups.some(ex => ex.some(p => ids.has(p.id)))) groups.push(g);
         }
       }
 
@@ -57,20 +47,15 @@ export const duplicateTools = [
         return { content: [{ type: 'text', text: 'No duplicate persons found 🎉' }] };
       }
 
-      const lines = limited.map((group, i) => {
-        const header = `**Group ${i + 1}** (${group.length} records)`;
-        const members = group.map(p => {
-          const email = p.emails?.[0]?.value ?? p.email?.[0]?.value ?? 'no email';
-          return `  • ID ${p.id} — ${p.name} — ${email}\n    https://app.pipedrive.com/person/${p.id}`;
-        }).join('\n');
-        return `${header}\n${members}`;
-      });
+      const lines = limited.map((group, i) =>
+        `**Group ${i + 1}** (${group.length} records)\n` +
+        group.map(p => `  • ID ${p.id} — ${p.name} — ${p.email?.[0]?.value ?? 'no email'}\n    https://app.pipedrive.com/person/${p.id}`).join('\n')
+      );
 
       return {
         content: [{
           type: 'text',
-          text: `Found ${limited.length} duplicate group(s):\n\n` +
-                lines.join('\n\n') +
+          text: `Found ${limited.length} duplicate group(s):\n\n` + lines.join('\n\n') +
                 `\n\nTo merge, call \`merge_persons\` with the two IDs.`,
         }],
       };
@@ -84,23 +69,17 @@ export const duplicateTools = [
       max_groups: z.number().int().min(1).max(50).default(20),
     }),
     async handler({ max_groups }) {
-      const allOrgs = await fetchAll((cursor) =>
-        organizations.getAll({ limit: 100, cursor })
-      );
-
-      const groups = groupBy(allOrgs, o => normalise(o.name)).slice(0, max_groups);
+      const allOrgs  = await fetchAll((opts) => organizations.getAll(opts));
+      const groups   = groupBy(allOrgs, o => normalise(o.name)).slice(0, max_groups);
 
       if (groups.length === 0) {
         return { content: [{ type: 'text', text: 'No duplicate organizations found 🎉' }] };
       }
 
-      const lines = groups.map((group, i) => {
-        const header = `**Group ${i + 1}** — "${group[0].name}" (${group.length} records)`;
-        const members = group.map(o =>
-          `  • ID ${o.id} — ${o.name} — ${o.people_count ?? 0} people\n    https://app.pipedrive.com/organization/${o.id}`
-        ).join('\n');
-        return `${header}\n${members}`;
-      });
+      const lines = groups.map((group, i) =>
+        `**Group ${i + 1}** — "${group[0].name}" (${group.length} records)\n` +
+        group.map(o => `  • ID ${o.id} — ${o.name} — ${o.people_count ?? 0} people\n    https://app.pipedrive.com/organization/${o.id}`).join('\n')
+      );
 
       return {
         content: [{
@@ -123,26 +102,18 @@ export const duplicateTools = [
       if (keep_id === delete_id) {
         return { content: [{ type: 'text', text: '❌ keep_id and delete_id must be different.' }] };
       }
-
-      const [keepRes, deleteRes] = await Promise.all([
-        persons.getOne(keep_id),
-        persons.getOne(delete_id),
-      ]);
-
-      const keeper  = keepRes?.data?.data ?? keepRes?.data;
-      const deleter = deleteRes?.data?.data ?? deleteRes?.data;
+      const [keepRes, deleteRes] = await Promise.all([persons.getOne(keep_id), persons.getOne(delete_id)]);
+      const keeper  = getData(keepRes)?.[0] ?? keepRes?.data;
+      const deleter = getData(deleteRes)?.[0] ?? deleteRes?.data;
 
       if (!keeper || !deleter) {
         return { content: [{ type: 'text', text: '❌ Could not find one or both person records.' }] };
       }
-
       await persons.merge(keep_id, delete_id);
-
       return {
         content: [{
           type: 'text',
-          text: `✅ Merged!\n• Kept: **${keeper.name}** (ID ${keep_id})\n• Deleted: **${deleter.name}** (ID ${delete_id})\n` +
-                `https://app.pipedrive.com/person/${keep_id}`,
+          text: `✅ Merged!\n• Kept: **${keeper.name}** (ID ${keep_id})\n• Deleted: **${deleter.name}** (ID ${delete_id})\nhttps://app.pipedrive.com/person/${keep_id}`,
         }],
       };
     },
@@ -159,26 +130,18 @@ export const duplicateTools = [
       if (keep_id === delete_id) {
         return { content: [{ type: 'text', text: '❌ keep_id and delete_id must be different.' }] };
       }
-
-      const [keepRes, deleteRes] = await Promise.all([
-        organizations.getOne(keep_id),
-        organizations.getOne(delete_id),
-      ]);
-
-      const keeper  = keepRes?.data?.data ?? keepRes?.data;
-      const deleter = deleteRes?.data?.data ?? deleteRes?.data;
+      const [keepRes, deleteRes] = await Promise.all([organizations.getOne(keep_id), organizations.getOne(delete_id)]);
+      const keeper  = getData(keepRes)?.[0] ?? keepRes?.data;
+      const deleter = getData(deleteRes)?.[0] ?? deleteRes?.data;
 
       if (!keeper || !deleter) {
         return { content: [{ type: 'text', text: '❌ Could not find one or both organizations.' }] };
       }
-
       await organizations.merge(keep_id, delete_id);
-
       return {
         content: [{
           type: 'text',
-          text: `✅ Organizations merged!\n• Kept: **${keeper.name}** (ID ${keep_id})\n• Deleted: **${deleter.name}** (ID ${delete_id})\n` +
-                `https://app.pipedrive.com/organization/${keep_id}`,
+          text: `✅ Organizations merged!\n• Kept: **${keeper.name}** (ID ${keep_id})\n• Deleted: **${deleter.name}** (ID ${delete_id})\nhttps://app.pipedrive.com/organization/${keep_id}`,
         }],
       };
     },

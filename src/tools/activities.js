@@ -1,17 +1,9 @@
-/**
- * tools/activities.js — Task & Activity Management
- */
-
-import { activities, formatActivity } from '../pipedrive.js';
+import { activities, getData, formatActivity } from '../pipedrive.js';
 import { notifyUpcomingTasks, notifyOverdueTasks } from '../teams.js';
 import { z } from 'zod';
 
-function todayStr()         { return new Date().toISOString().slice(0, 10); }
-function dateStr(daysAhead) {
-  const d = new Date();
-  d.setDate(d.getDate() + daysAhead);
-  return d.toISOString().replace('T', ' ').slice(0, 19); // YYYY-MM-DD HH:MM:SS
-}
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const futureDateStr = (days) => { const d = new Date(); d.setDate(d.getDate() + days); return d.toISOString().slice(0, 10); };
 
 export const activityTools = [
 
@@ -23,33 +15,23 @@ export const activityTools = [
       limit: z.number().int().min(1).max(100).default(50),
     }),
     async handler({ days, limit }) {
-      const now    = new Date().toISOString().replace('T', ' ').slice(0, 19);
-      const future = dateStr(days);
-
-      const res   = await activities.getAll({ done: 0, updated_since: now, limit });
-      const all   = (res?.data?.data ?? res?.data ?? []);
-
-      // Filter to those with due_date within range
       const today  = todayStr();
-      const cutoff = new Date(); cutoff.setDate(cutoff.getDate() + days);
-      const cutoffStr = cutoff.toISOString().slice(0, 10);
+      const cutoff = futureDateStr(days);
 
-      const items = all
-        .filter(a => a.due_date && a.due_date >= today && a.due_date <= cutoffStr)
+      const res   = await activities.getAll({ done: 0, limit: 100 });
+      const items = getData(res)
+        .filter(a => a.due_date && a.due_date >= today && a.due_date <= cutoff)
         .slice(0, limit)
         .map(formatActivity);
 
       if (items.length === 0) {
         return { content: [{ type: 'text', text: `No activities due in the next ${days} day(s).` }] };
       }
-
       return {
         content: [{
           type: 'text',
           text: `${items.length} activity/ies due in the next ${days} day(s):\n\n` +
-            items.map(a =>
-              `• [${a.due_date} ${a.due_time}] **${a.subject}** (${a.type}) — Owner: ${a.owner}${a.deal ? ` — Deal: ${a.deal}` : ''}${a.url ? `\n  ${a.url}` : ''}`
-            ).join('\n'),
+            items.map(a => `• [${a.due_date} ${a.due_time}] **${a.subject}** (${a.type}) — Owner: ${a.owner}${a.deal ? ` — ${a.deal}` : ''}${a.url ? `\n  ${a.url}` : ''}`).join('\n'),
         }],
         _data: items,
       };
@@ -63,14 +45,9 @@ export const activityTools = [
       limit: z.number().int().min(1).max(100).default(50),
     }),
     async handler({ limit }) {
-      const yesterday = new Date();
-      yesterday.setDate(yesterday.getDate() - 1);
-      const cutoffStr = yesterday.toISOString().slice(0, 10);
-
-      // Fetch not-done activities updated any time, filter by due_date < today
-      const res   = await activities.getAll({ done: 0, limit: 100 });
       const today = todayStr();
-      const items = (res?.data?.data ?? res?.data ?? [])
+      const res   = await activities.getAll({ done: 0, limit: 100 });
+      const items = getData(res)
         .filter(a => a.due_date && a.due_date < today)
         .slice(0, limit)
         .map(formatActivity);
@@ -78,14 +55,11 @@ export const activityTools = [
       if (items.length === 0) {
         return { content: [{ type: 'text', text: 'No overdue activities 🎉 Everyone is on track!' }] };
       }
-
       return {
         content: [{
           type: 'text',
           text: `⚠️ ${items.length} overdue activity/ies:\n\n` +
-            items.map(a =>
-              `• **[OVERDUE: ${a.due_date}]** ${a.subject} (${a.type}) — Owner: ${a.owner}${a.deal ? ` — Deal: ${a.deal}` : ''}`
-            ).join('\n'),
+            items.map(a => `• **[OVERDUE: ${a.due_date}]** ${a.subject} (${a.type}) — Owner: ${a.owner}${a.deal ? ` — ${a.deal}` : ''}`).join('\n'),
         }],
         _data: items,
       };
@@ -99,19 +73,16 @@ export const activityTools = [
       days: z.number().int().min(1).max(14).default(1),
     }),
     async handler({ days }) {
-      const today     = todayStr();
-      const cutoff    = new Date(); cutoff.setDate(cutoff.getDate() + days);
-      const cutoffStr = cutoff.toISOString().slice(0, 10);
-
-      const res   = await activities.getAll({ done: 0, limit: 100 });
-      const items = (res?.data?.data ?? res?.data ?? [])
-        .filter(a => a.due_date && a.due_date >= today && a.due_date <= cutoffStr)
+      const today  = todayStr();
+      const cutoff = futureDateStr(days);
+      const res    = await activities.getAll({ done: 0, limit: 100 });
+      const items  = getData(res)
+        .filter(a => a.due_date && a.due_date >= today && a.due_date <= cutoff)
         .map(formatActivity);
 
       if (items.length === 0) {
         return { content: [{ type: 'text', text: `No upcoming tasks in ${days} day(s). No Teams alert sent.` }] };
       }
-
       const result = await notifyUpcomingTasks(items, days);
       return {
         content: [{
@@ -128,16 +99,12 @@ export const activityTools = [
     schema: z.object({}),
     async handler() {
       const today = todayStr();
-
       const res   = await activities.getAll({ done: 0, limit: 100 });
-      const items = (res?.data?.data ?? res?.data ?? [])
-        .filter(a => a.due_date && a.due_date < today)
-        .map(formatActivity);
+      const items = getData(res).filter(a => a.due_date && a.due_date < today).map(formatActivity);
 
       if (items.length === 0) {
         return { content: [{ type: 'text', text: 'No overdue tasks. No Teams alert sent.' }] };
       }
-
       const result = await notifyOverdueTasks(items);
       return {
         content: [{
@@ -158,7 +125,7 @@ export const activityTools = [
       due_time:  z.string().regex(/^\d{2}:\d{2}$/).optional().describe('HH:MM (24h)'),
       deal_id:   z.number().int().optional(),
       person_id: z.number().int().optional(),
-      user_id:   z.number().int().optional().describe('Assign to a specific team member'),
+      user_id:   z.number().int().optional(),
       note:      z.string().optional(),
     }),
     async handler(args) {
@@ -173,12 +140,9 @@ export const activityTools = [
         ...(args.user_id   && { user_id:   args.user_id }),
         ...(args.note      && { note:      args.note }),
       };
-
       const res = await activities.create(body);
-      const a   = res?.data?.data ?? res?.data;
-
+      const a   = res?.data ?? getData(res)?.[0];
       if (!a) throw new Error('Failed to create activity — no data returned.');
-
       return {
         content: [{
           type: 'text',
