@@ -1,15 +1,17 @@
 /**
  * index.js — Pipedrive MCP Server
  * ─────────────────────────────────────────────
- * MCP SDK v1.x SSE transport pattern:
- *   GET  /sse       — client connects, server streams events back
- *   POST /messages  — client sends tool-call messages (must include ?sessionId=)
+ * Uses StreamableHTTPServerTransport (the modern MCP transport).
+ * Single endpoint: POST /mcp  (also handles GET for SSE streaming)
+ * Legacy SSE endpoints kept at /sse + /messages for backward compat.
  */
 
 import 'dotenv/config';
+import { randomUUID } from 'node:crypto';
 import express from 'express';
-import { Server }             from '@modelcontextprotocol/sdk/server/index.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { Server }                        from '@modelcontextprotocol/sdk/server/index.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { SSEServerTransport }            from '@modelcontextprotocol/sdk/server/sse.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { createRequire } from 'module';
 
@@ -40,10 +42,6 @@ const ALL_TOOLS = [
   ...analysisTools,
   ...reportTools,
 ];
-
-// ── Active transports — keyed by sessionId ────────────────────────────────────
-// The SSE client receives its sessionId via the stream, then uses it on POST /messages
-const activeTransports = new Map();
 
 // ── MCP server factory ────────────────────────────────────────────────────────
 function createMcpServer() {
@@ -90,8 +88,9 @@ app.use(express.json());
 // CORS — allow Cowork/Claude to connect from any origin
 app.use((_req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, mcp-session-id');
+  res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
   if (_req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
@@ -101,38 +100,70 @@ app.get('/health', (_req, res) =>
   res.json({ status: 'ok', server: 'pipedrive-mcp', tools: ALL_TOOLS.length, time: new Date().toISOString() })
 );
 
-// SSE endpoint — auth required here; client gets a sessionId back via the stream
-app.get('/sse', async (req, res) => {
-  console.log(`[SSE] Client connected from ${req.ip}`);
-  const transport = new SSEServerTransport('/messages', res);
+// ── Modern StreamableHTTP endpoint (/mcp) ─────────────────────────────────────
+// Cowork uses this protocol. Single endpoint handles GET + POST.
+const streamableTransports = new Map(); // sessionId → transport
 
-  // Store so POST /messages can route to the right transport
-  activeTransports.set(transport.sessionId, transport);
-  console.log(`[SSE] Session ${transport.sessionId} registered`);
+app.all('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
 
-  req.on('close', () => {
-    activeTransports.delete(transport.sessionId);
-    console.log(`[SSE] Session ${transport.sessionId} closed`);
+  // Re-use existing transport for this session
+  if (sessionId && streamableTransports.has(sessionId)) {
+    const transport = streamableTransports.get(sessionId);
+    await transport.handleRequest(req, res, req.body);
+    return;
+  }
+
+  // New session — only POST (initialize) should create a new transport
+  if (req.method !== 'POST') {
+    res.status(400).json({ error: 'No session found. Send POST to initialize.' });
+    return;
+  }
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
   });
 
+  transport.onclose = () => {
+    if (transport.sessionId) streamableTransports.delete(transport.sessionId);
+    console.log(`[MCP] Session ${transport.sessionId} closed`);
+  };
+
+  const server = createMcpServer();
+  await server.connect(transport);
+
+  // Handle the initialize request — after connect the sessionId is set
+  await transport.handleRequest(req, res, req.body);
+
+  if (transport.sessionId) {
+    streamableTransports.set(transport.sessionId, transport);
+    console.log(`[MCP] New session ${transport.sessionId}`);
+  }
+});
+
+// ── Legacy SSE endpoints (/sse + /messages) ───────────────────────────────────
+// Kept for any older clients that still use the SSE protocol.
+const sseTransports = new Map();
+
+app.get('/sse', async (req, res) => {
+  console.log(`[SSE] Client connected`);
+  const transport = new SSEServerTransport('/messages', res);
+  sseTransports.set(transport.sessionId, transport);
+  req.on('close', () => sseTransports.delete(transport.sessionId));
   const server = createMcpServer();
   await server.connect(transport);
 });
 
-// Message endpoint — no separate auth; sessionId links to an already-authenticated transport
 app.post('/messages', async (req, res) => {
-  const sessionId  = req.query.sessionId;
-  const transport  = activeTransports.get(sessionId);
-
-  if (!transport) {
-    console.warn(`[Messages] Unknown sessionId: ${sessionId}`);
-    return res.status(400).json({ error: `No active session for sessionId: ${sessionId}` });
-  }
-
+  const sessionId = req.query.sessionId;
+  const transport = sseTransports.get(sessionId);
+  if (!transport) return res.status(400).json({ error: `No session: ${sessionId}` });
   await transport.handlePostMessage(req, res, req.body);
 });
 
 app.listen(PORT, () => {
   console.log(`\n✅ Pipedrive MCP server on port ${PORT} — ${ALL_TOOLS.length} tools loaded`);
+  console.log(`   StreamableHTTP: POST /mcp`);
+  console.log(`   Legacy SSE:     GET  /sse`);
   ALL_TOOLS.forEach(t => console.log(`   • ${t.name}`));
 });
