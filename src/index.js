@@ -4,9 +4,6 @@
  * MCP SDK v1.x SSE transport pattern:
  *   GET  /sse       — client connects, server streams events back
  *   POST /messages  — client sends tool-call messages (must include ?sessionId=)
- *
- * Auth: Bearer token required on /sse. /messages uses sessionId to find
- * the already-authenticated transport, so no separate auth needed there.
  */
 
 import 'dotenv/config';
@@ -27,15 +24,12 @@ import { analysisTools }   from './tools/analysis.js';
 import { reportTools }     from './tools/reports.js';
 
 // ── Validate environment ──────────────────────────────────────────────────────
-for (const key of ['PIPEDRIVE_API_TOKEN', 'MCP_AUTH_TOKEN']) {
-  if (!process.env[key]) {
-    console.error(`❌ Missing required env var: ${key}`);
-    process.exit(1);
-  }
+if (!process.env.PIPEDRIVE_API_TOKEN) {
+  console.error('❌ Missing required env var: PIPEDRIVE_API_TOKEN');
+  process.exit(1);
 }
 
-const PORT           = parseInt(process.env.PORT ?? '3000', 10);
-const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
+const PORT = parseInt(process.env.PORT ?? '3000', 10);
 
 // ── All tools ─────────────────────────────────────────────────────────────────
 const ALL_TOOLS = [
@@ -102,21 +96,13 @@ app.use((_req, res, next) => {
   next();
 });
 
-function requireAuth(req, res, next) {
-  const token = (req.headers['authorization'] ?? '').replace(/^Bearer\s+/i, '').trim();
-  if (token !== MCP_AUTH_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized — check MCP_AUTH_TOKEN' });
-  }
-  next();
-}
-
-// Health check (no auth)
+// Health check
 app.get('/health', (_req, res) =>
   res.json({ status: 'ok', server: 'pipedrive-mcp', tools: ALL_TOOLS.length, time: new Date().toISOString() })
 );
 
 // SSE endpoint — auth required here; client gets a sessionId back via the stream
-app.get('/sse', requireAuth, async (req, res) => {
+app.get('/sse', async (req, res) => {
   console.log(`[SSE] Client connected from ${req.ip}`);
   const transport = new SSEServerTransport('/messages', res);
 
