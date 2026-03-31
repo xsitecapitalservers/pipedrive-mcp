@@ -1,37 +1,53 @@
-import { activities, getData, formatActivity } from '../pipedrive.js';
+import { activities, fetchAll, getData, formatActivity } from '../pipedrive.js';
 import { notifyUpcomingTasks, notifyOverdueTasks } from '../teams.js';
 import { z } from 'zod';
 
-const todayStr = () => new Date().toISOString().slice(0, 10);
+const todayStr     = () => new Date().toISOString().slice(0, 10);
 const futureDateStr = (days) => { const d = new Date(); d.setDate(d.getDate() + days); return d.toISOString().slice(0, 10); };
+
+// Fetch ALL activities for a user (paginated) or a capped batch for all users.
+// user_id: specific user ID, or 0 for all users (default in pipedrive.js wrapper).
+async function fetchActivities(opts = {}) {
+  const { user_id, ...rest } = opts;
+  if (user_id) {
+    // Paginate fully for a specific user so we don't miss any
+    return fetchAll((pageOpts) => activities.getAll({ user_id, ...rest, ...pageOpts }));
+  }
+  // All-users: fetch up to 500 to keep API calls reasonable
+  const page1 = await activities.getAll({ ...rest, limit: 100, start: 0 });
+  const data  = getData(page1);
+  return data;
+}
 
 export const activityTools = [
 
   {
     name: 'get_upcoming_activities',
-    description: 'List all open activities due within the next N days.',
+    description: 'List open activities due within the next N days. Optionally filter by a specific team member — use get_users to find their user_id.',
     schema: z.object({
-      days:  z.number().int().min(1).max(30).default(3),
-      limit: z.number().int().min(1).max(100).default(50),
+      days:    z.number().int().min(1).max(30).default(3),
+      limit:   z.number().int().min(1).max(200).default(50),
+      user_id: z.number().int().optional().describe('Filter to a specific team member. Omit for all users.'),
     }),
-    async handler({ days, limit }) {
+    async handler({ days, limit, user_id }) {
       const today  = todayStr();
       const cutoff = futureDateStr(days);
 
-      const res   = await activities.getAll({ done: 0, limit: 100 });
-      const items = getData(res)
+      const all   = await fetchActivities({ done: 0, user_id });
+      const items = all
         .filter(a => a.due_date && a.due_date >= today && a.due_date <= cutoff)
         .slice(0, limit)
         .map(formatActivity);
 
+      const who = user_id ? `user ${user_id}` : 'all users';
       if (items.length === 0) {
-        return { content: [{ type: 'text', text: `No activities due in the next ${days} day(s).` }] };
+        return { content: [{ type: 'text', text: `No activities due in the next ${days} day(s) for ${who}.` }] };
       }
       return {
         content: [{
           type: 'text',
-          text: `${items.length} activity/ies due in the next ${days} day(s):\n\n` +
-            items.map(a => `• [${a.due_date} ${a.due_time}] **${a.subject}** (${a.type}) — Owner: ${a.owner}${a.deal ? ` — ${a.deal}` : ''}${a.url ? `\n  ${a.url}` : ''}`).join('\n'),
+          text: `${items.length} activity/ies due in the next ${days} day(s) (${who}):\n\n` +
+            items.map(a => `• [${a.due_date} ${a.due_time || ''}] **${a.subject}** (${a.type}) — Owner: ${a.owner}${a.deal ? ` — ${a.deal}` : ''}${a.url ? `\n  ${a.url}` : ''}`).join('\n'),
         }],
         _data: items,
       };
@@ -40,25 +56,28 @@ export const activityTools = [
 
   {
     name: 'get_overdue_activities',
-    description: 'List all activities that are past their due date and still not completed.',
+    description: 'List activities that are past their due date and still not completed. Optionally filter by a specific team member — use get_users to find their user_id.',
     schema: z.object({
-      limit: z.number().int().min(1).max(100).default(50),
+      limit:   z.number().int().min(1).max(200).default(50),
+      user_id: z.number().int().optional().describe('Filter to a specific team member. Omit for all users.'),
     }),
-    async handler({ limit }) {
+    async handler({ limit, user_id }) {
       const today = todayStr();
-      const res   = await activities.getAll({ done: 0, limit: 100 });
-      const items = getData(res)
+
+      const all   = await fetchActivities({ done: 0, user_id });
+      const items = all
         .filter(a => a.due_date && a.due_date < today)
         .slice(0, limit)
         .map(formatActivity);
 
+      const who = user_id ? `user ${user_id}` : 'all users';
       if (items.length === 0) {
-        return { content: [{ type: 'text', text: 'No overdue activities 🎉 Everyone is on track!' }] };
+        return { content: [{ type: 'text', text: `No overdue activities for ${who} 🎉` }] };
       }
       return {
         content: [{
           type: 'text',
-          text: `⚠️ ${items.length} overdue activity/ies:\n\n` +
+          text: `⚠️ ${items.length} overdue activity/ies (${who}):\n\n` +
             items.map(a => `• **[OVERDUE: ${a.due_date}]** ${a.subject} (${a.type}) — Owner: ${a.owner}${a.deal ? ` — ${a.deal}` : ''}`).join('\n'),
         }],
         _data: items,
@@ -70,13 +89,15 @@ export const activityTools = [
     name: 'notify_upcoming_tasks',
     description: 'Fetch upcoming activities and send a Microsoft Teams notification.',
     schema: z.object({
-      days: z.number().int().min(1).max(14).default(1),
+      days:    z.number().int().min(1).max(14).default(1),
+      user_id: z.number().int().optional().describe('Filter to a specific team member. Omit for all users.'),
     }),
-    async handler({ days }) {
+    async handler({ days, user_id }) {
       const today  = todayStr();
       const cutoff = futureDateStr(days);
-      const res    = await activities.getAll({ done: 0, limit: 100 });
-      const items  = getData(res)
+
+      const all   = await fetchActivities({ done: 0, user_id });
+      const items = all
         .filter(a => a.due_date && a.due_date >= today && a.due_date <= cutoff)
         .map(formatActivity);
 
@@ -96,11 +117,14 @@ export const activityTools = [
   {
     name: 'notify_overdue_tasks',
     description: 'Find all overdue activities and fire a Teams warning message.',
-    schema: z.object({}),
-    async handler() {
+    schema: z.object({
+      user_id: z.number().int().optional().describe('Filter to a specific team member. Omit for all users.'),
+    }),
+    async handler({ user_id }) {
       const today = todayStr();
-      const res   = await activities.getAll({ done: 0, limit: 100 });
-      const items = getData(res).filter(a => a.due_date && a.due_date < today).map(formatActivity);
+
+      const all   = await fetchActivities({ done: 0, user_id });
+      const items = all.filter(a => a.due_date && a.due_date < today).map(formatActivity);
 
       if (items.length === 0) {
         return { content: [{ type: 'text', text: 'No overdue tasks. No Teams alert sent.' }] };
@@ -125,7 +149,7 @@ export const activityTools = [
       due_time:  z.string().regex(/^\d{2}:\d{2}$/).optional().describe('HH:MM (24h)'),
       deal_id:   z.number().int().optional(),
       person_id: z.number().int().optional(),
-      user_id:   z.number().int().optional(),
+      user_id:   z.number().int().optional().describe('Assign to a specific team member. Use get_users to find IDs.'),
       note:      z.string().optional(),
     }),
     async handler(args) {
